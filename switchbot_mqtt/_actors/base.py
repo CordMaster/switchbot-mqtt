@@ -32,8 +32,8 @@ import queue
 import shlex
 import typing
 
-import bluepy.btle
 import paho.mqtt.client
+import asyncio_mqtt
 import switchbot
 from switchbot_mqtt._utils import (
     _join_mqtt_topic_levels,
@@ -87,72 +87,42 @@ class _MQTTControlledActor(abc.ABC):
     ) -> None:
         # alternative: pySwitchbot >=0.10.0 provides SwitchbotDevice.get_mac()
         self._mac_address = mac_address
+        self._retry_count = retry_count
+        self._password = password
+    
+    @abc.abstractmethod
+    async def _connect(self):
+        raise NotImplementedError()
 
     @abc.abstractmethod
     def _get_device(self) -> switchbot.SwitchbotDevice:
         raise NotImplementedError()
 
-    def _update_device_info(self) -> None:
-        log_queue: queue.Queue[logging.LogRecord] = queue.Queue(maxsize=0)
-        logging.getLogger("switchbot").addHandler(_QueueLogHandler(log_queue))
-        try:
-            self._get_device().update()
-            # pySwitchbot>=v0.10.1 catches bluepy.btle.BTLEManagementError :(
-            # https://github.com/Danielhiversen/pySwitchbot/blob/0.10.1/switchbot/__init__.py#L141
-            # pySwitchbot<0.11.0 WARNING, >=0.11.0 ERROR
-            while not log_queue.empty():
-                log_record = log_queue.get()
-                if log_record.exc_info:
-                    exc: typing.Optional[BaseException] = log_record.exc_info[1]
-                    if (
-                        isinstance(exc, bluepy.btle.BTLEManagementError)
-                        and exc.emsg == "Permission Denied"
-                    ):
-                        raise exc
-        except bluepy.btle.BTLEManagementError as exc:
-            if (
-                exc.emsg == "Permission Denied"
-                and exc.message == "Failed to execute management command 'le on'"
-            ):
-                raise PermissionError(
-                    "bluepy-helper failed to enable low energy mode"
-                    " due to insufficient permissions."
-                    "\nSee https://github.com/IanHarvey/bluepy/issues/313#issuecomment-428324639"
-                    ", https://github.com/fphammerle/switchbot-mqtt/pull/31#issuecomment-846383603"
-                    ", and https://github.com/IanHarvey/bluepy/blob/v/1.3.0/bluepy"
-                    "/bluepy-helper.c#L1260."
-                    "\nInsecure workaround:"
-                    "\n1. sudo apt-get install --no-install-recommends libcap2-bin"
-                    f"\n2. sudo setcap cap_net_admin+ep {shlex.quote(bluepy.btle.helperExe)}"
-                    "\n3. restart switchbot-mqtt"
-                    "\nIn docker-based setups, you could use"
-                    " `sudo docker run --cap-drop ALL --cap-add NET_ADMIN --user 0 …`"
-                    " (seriously insecure)."
-                ) from exc
-            raise
+    async def _update_device_info(self) -> None:
+        await self._get_device().update()
 
-    def _report_battery_level(
-        self, mqtt_client: paho.mqtt.client.Client, mqtt_topic_prefix: str
+    async def _report_battery_level(
+        self, mqtt_client: asyncio_mqtt.Client, mqtt_topic_prefix: str
     ) -> None:
         # > battery: Percentage of battery that is left.
         # https://www.home-assistant.io/integrations/sensor/#device-class
-        self._mqtt_publish(
+        await self._mqtt_publish(
             topic_prefix=mqtt_topic_prefix,
             topic_levels=self._MQTT_BATTERY_PERCENTAGE_TOPIC_LEVELS,
             payload=str(self._get_device().get_battery_percent()).encode(),
             mqtt_client=mqtt_client,
         )
 
-    def _update_and_report_device_info(
-        self, mqtt_client: paho.mqtt.client.Client, mqtt_topic_prefix: str
+    async def _update_and_report_device_info(
+        self, mqtt_client: asyncio_mqtt.Client, mqtt_topic_prefix: str
     ) -> None:
-        self._update_device_info()
-        self._report_battery_level(
+        await self._update_device_info()
+        await self._report_battery_level(
             mqtt_client=mqtt_client, mqtt_topic_prefix=mqtt_topic_prefix
         )
 
     @classmethod
-    def _init_from_topic(
+    async def _init_from_topic(
         cls,
         topic: str,
         expected_topic_levels: typing.Collection[_MQTTTopicLevel],
@@ -170,17 +140,22 @@ class _MQTTControlledActor(abc.ABC):
         if not _mac_address_valid(mac_address):
             _LOGGER.warning("invalid mac address %s", mac_address)
             return None
-        return cls(
+
+        actor = cls(
             mac_address=mac_address,
             retry_count=settings.retry_count,
             password=settings.device_passwords.get(mac_address, None),
         )
 
+        await actor._connect()
+
+        return actor
+
     @classmethod
-    def _mqtt_update_device_info_callback(
+    async def _mqtt_update_device_info_callback(
         # pylint: disable=duplicate-code; other callbacks with same params
         cls,
-        mqtt_client: paho.mqtt.client.Client,
+        mqtt_client: asyncio_mqtt.Client,
         userdata: _MQTTCallbackUserdata,
         message: paho.mqtt.client.MQTTMessage,
     ) -> None:
@@ -190,11 +165,13 @@ class _MQTTControlledActor(abc.ABC):
         if message.retain:
             _LOGGER.info("ignoring retained message")
             return
-        actor = cls._init_from_topic(
+
+        actor = await cls._init_from_topic(
             topic=message.topic,
             expected_topic_levels=cls._MQTT_UPDATE_DEVICE_INFO_TOPIC_LEVELS,
             settings=userdata,
         )
+
         if actor:
             # pylint: disable=protected-access; own instance
             actor._update_and_report_device_info(
@@ -202,21 +179,21 @@ class _MQTTControlledActor(abc.ABC):
             )
 
     @abc.abstractmethod
-    def execute_command(  # pylint: disable=duplicate-code; implementations
+    async def execute_command(  # pylint: disable=duplicate-code; implementations
         self,
         *,
         mqtt_message_payload: bytes,
-        mqtt_client: paho.mqtt.client.Client,
+        mqtt_client: asyncio_mqtt.Client,
         update_device_info: bool,
         mqtt_topic_prefix: str,
     ) -> None:
         raise NotImplementedError()
 
     @classmethod
-    def _mqtt_command_callback(
+    async def _mqtt_command_callback(
         # pylint: disable=duplicate-code; other callbacks with same params
         cls,
-        mqtt_client: paho.mqtt.client.Client,
+        mqtt_client: asyncio_mqtt.Client,
         userdata: _MQTTCallbackUserdata,
         message: paho.mqtt.client.MQTTMessage,
     ) -> None:
@@ -226,13 +203,15 @@ class _MQTTControlledActor(abc.ABC):
         if message.retain:
             _LOGGER.info("ignoring retained message")
             return
-        actor = cls._init_from_topic(
+
+        actor = await cls._init_from_topic(
             topic=message.topic,
             expected_topic_levels=cls.MQTT_COMMAND_TOPIC_LEVELS,
             settings=userdata,
         )
+
         if actor:
-            actor.execute_command(
+            await actor.execute_command(
                 mqtt_message_payload=message.payload,
                 mqtt_client=mqtt_client,
                 update_device_info=userdata.fetch_device_info,
@@ -245,7 +224,7 @@ class _MQTTControlledActor(abc.ABC):
         *,
         enable_device_info_update_topic: bool,
     ) -> typing.Dict[typing.Tuple[_MQTTTopicLevel, ...], typing.Callable]:
-        # returning dict because `paho.mqtt.client.Client.message_callback_add` overwrites
+        # returning dict because `asyncio_mqtt.Client.message_callback_add` overwrites
         # callbacks with same topic pattern
         # https://github.com/eclipse/paho.mqtt.python/blob/v1.6.1/src/paho/mqtt/client.py#L2304
         # https://github.com/eclipse/paho.mqtt.python/blob/v1.6.1/src/paho/mqtt/matcher.py#L19
@@ -257,8 +236,8 @@ class _MQTTControlledActor(abc.ABC):
         return callbacks
 
     @classmethod
-    def mqtt_subscribe(
-        cls, *, mqtt_client: paho.mqtt.client.Client, settings: _MQTTCallbackUserdata
+    async def mqtt_subscribe(
+        cls, *, mqtt_client: asyncio_mqtt.Client, settings: _MQTTCallbackUserdata
     ) -> None:
         for topic_levels, callback in cls._get_mqtt_message_callbacks(
             enable_device_info_update_topic=settings.fetch_device_info
@@ -266,19 +245,21 @@ class _MQTTControlledActor(abc.ABC):
             topic = _join_mqtt_topic_levels(
                 topic_prefix=settings.mqtt_topic_prefix,
                 topic_levels=topic_levels,
-                mac_address="+",
+                mac_address="+"
             )
             _LOGGER.info("subscribing to MQTT topic %r", topic)
-            mqtt_client.subscribe(topic)
-            mqtt_client.message_callback_add(sub=topic, callback=callback)
+            await mqtt_client.subscribe(topic)
+            async with mqtt_client.filtered_messages(topic) as messages:
+                async for message in messages:
+                    await callback(mqtt_client, settings, message)
 
-    def _mqtt_publish(
+    async def _mqtt_publish(
         self,
         *,
         topic_prefix: str,
         topic_levels: typing.Iterable[_MQTTTopicLevel],
         payload: bytes,
-        mqtt_client: paho.mqtt.client.Client,
+        mqtt_client: asyncio_mqtt.Client,
     ) -> None:
         topic = _join_mqtt_topic_levels(
             topic_prefix=topic_prefix,
@@ -287,24 +268,25 @@ class _MQTTControlledActor(abc.ABC):
         )
         # https://pypi.org/project/paho-mqtt/#publishing
         _LOGGER.debug("publishing topic=%s payload=%r", topic, payload)
-        message_info: paho.mqtt.client.MQTTMessageInfo = mqtt_client.publish(
-            topic=topic, payload=payload, retain=True
-        )
-        # wait before checking status?
-        if message_info.rc != paho.mqtt.client.MQTT_ERR_SUCCESS:
+
+        try:
+            await mqtt_client.publish(
+                topic=topic, payload=payload, retain=True
+            )
+        except asyncio_mqtt.MQTTCodeError as rc:
             _LOGGER.error(
                 "Failed to publish MQTT message on topic %s (rc=%d)",
                 topic,
-                message_info.rc,
+                rc,
             )
 
-    def report_state(
+    async def report_state(
         self,
         state: bytes,
-        mqtt_client: paho.mqtt.client.Client,
+        mqtt_client: asyncio_mqtt.Client,
         mqtt_topic_prefix: str,
     ) -> None:
-        self._mqtt_publish(
+        await self._mqtt_publish(
             topic_prefix=mqtt_topic_prefix,
             topic_levels=self.MQTT_STATE_TOPIC_LEVELS,
             payload=state,

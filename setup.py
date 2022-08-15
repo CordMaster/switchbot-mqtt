@@ -76,14 +76,10 @@ setuptools.setup(
     # >=3.7 postponed evaluation of type annotations (PEP563) & dataclass
     python_requires=">=3.7",
     install_requires=[
-        # >=1.3.0 for btle.BTLEManagementError (could be replaced with BTLEException)
-        # >=0.1.0 for btle.helperExe
-        # https://github.com/IanHarvey/bluepy/tree/v/1.3.0#release-notes
-        "bluepy>=1.3.0,<2",
         # >=0.10.0 for SwitchbotCurtain.{update,get_position}
         # >=0.9.0 for SwitchbotCurtain.set_position
-        "PySwitchbot>=0.10.0,<0.13",
-        "paho-mqtt<2",
+        "PySwitchbot>=0.15.0",
+        "asyncio-mqtt>=0.12.0",
     ],
     setup_requires=["setuptools_scm"],
     tests_require=["pytest"],
